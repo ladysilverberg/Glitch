@@ -2,7 +2,7 @@ use std::sync::Arc;
 use vulkano::{
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     device::physical::{PhysicalDevice, PhysicalDeviceType},
-    device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueFlags, QueueCreateInfo},
+    device::{Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueFlags, QueueCreateInfo},
     swapchain::{Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo, acquire_next_image},
     memory::allocator::{StandardMemoryAllocator, AllocationCreateInfo, MemoryTypeFilter},
     buffer::{Buffer, BufferCreateInfo, BufferUsage, BufferContents, Subbuffer},
@@ -13,6 +13,7 @@ use vulkano::{
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
             rasterization::RasterizationState,
+            subpass::PipelineRenderingCreateInfo,
             vertex_input::VertexDefinition,
             vertex_input::Vertex as VkVertex,
             viewport::{Viewport, ViewportState},
@@ -21,13 +22,13 @@ use vulkano::{
         layout::PipelineDescriptorSetLayoutCreateInfo,
         GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo, DynamicState,
     },
-    command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents},
+    command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, RenderingAttachmentInfo, RenderingInfo, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents},
     command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
     descriptor_set::{WriteDescriptorSet},
     descriptor_set::allocator::StandardDescriptorSetAllocator,
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    render_pass::{AttachmentLoadOp, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     sync::{self, GpuFuture},
-    VulkanLibrary, VulkanError, Validated,
+    VulkanLibrary, VulkanError, Validated, Version,
 };
 use winit::{
     application::ApplicationHandler,
@@ -40,16 +41,30 @@ struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
     queue: Arc<Queue>,
-    memory_allocator: Arc<StandardMemoryAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    render_data: RenderData,
     render_context: Option<RenderContext>,
+}
+
+struct RenderData {
+    vertex_buffer: Subbuffer<[Vertex]>,
+}
+
+struct LegacyRenderContext {
+    window: Arc<Window>,
+    swapchain: Arc<Swapchain>,
+    render_pass: Arc<RenderPass>,
+    framebuffers: Vec<Arc<Framebuffer>>,
+    pipeline: Arc<GraphicsPipeline>,
+    viewport: Viewport,
+    recreate_swapchain: bool,
+    previous_frame_end: Option<Box<dyn GpuFuture>>,
 }
 
 struct RenderContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
-    render_pass: Arc<RenderPass>,
-    framebuffers: Vec<Arc<Framebuffer>>,
+    attachment_image_views: Vec<Arc<ImageView>>,
     pipeline: Arc<GraphicsPipeline>,
     viewport: Viewport,
     recreate_swapchain: bool,
@@ -68,6 +83,10 @@ fn select_physical_device(instance: &Arc<Instance>, event_loop: &EventLoop<()>, 
     instance
         .enumerate_physical_devices()
         .expect("could not enumerate devices")
+        .filter(|p| {
+            // TODO: Fallback if no such device?
+            p.api_version() >= Version::V1_3 || p.supported_extensions().khr_dynamic_rendering
+        })
         .filter(|p| p.supported_extensions().contains(&device_extensions))
         .filter_map(|p| {
             p.queue_family_properties()
@@ -91,6 +110,14 @@ fn select_physical_device(instance: &Arc<Instance>, event_loop: &EventLoop<()>, 
         .expect("no device available")
 }
 
+// Vulkan 1.3 Dynamic Rendering allows not using frame buffers
+fn get_image_views(images: &[Arc<Image>]) -> Vec<Arc<ImageView>> {
+    images
+        .iter()
+        .map(|image| ImageView::new_default(image.clone()).unwrap())
+        .collect::<Vec<_>>()
+}
+
 fn get_framebuffers(images: &[Arc<Image>], render_pass: &Arc<RenderPass>) -> Vec<Arc<Framebuffer>> {
     images
         .iter()
@@ -108,6 +135,183 @@ fn get_framebuffers(images: &[Arc<Image>], render_pass: &Arc<RenderPass>) -> Vec
         .collect::<Vec<_>>()
 }
 
+fn create_render_pass_and_pipeline(device: &Arc<Device>, swapchain: &Arc<Swapchain>, images: &[Arc<Image>]) -> (Arc<GraphicsPipeline>, Arc<RenderPass>) {
+    // Shaders
+    mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            src: r"
+                #version 450
+
+                layout(location = 0) in vec2 position;
+
+                void main() {
+                    gl_Position = vec4(position, 0.0, 1.0);
+                }
+            ",
+        }
+    }
+
+    mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            src: r"
+                #version 450
+
+                layout(location = 0) out vec4 f_color;
+
+                void main() {
+                    f_color = vec4(1.0, 0.0, 0.0, 1.0);
+                }
+            ",
+        }
+    }
+
+    // Render Pass
+    let render_pass = vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            color: {
+                format: swapchain.image_format(),
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
+        }
+    ).unwrap();
+
+    // Framebuffers
+    let framebuffers = get_framebuffers(images, &render_pass);
+
+    let pipeline = {
+        let vs = vs::load(device.clone()).unwrap().entry_point("main").unwrap();
+        let fs = fs::load(device.clone()).unwrap().entry_point("main").unwrap();
+
+        let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        ).unwrap();
+
+        // Legacy
+        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+        GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState::default()), // Triangles
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    subpass.num_color_attachments(),
+                    ColorBlendAttachmentState::default()
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            }
+        ).unwrap()
+    };
+
+    (pipeline, render_pass)
+}
+
+// Vulkan 1.3 Dynamic Rendering
+fn create_pipeline(device: &Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<GraphicsPipeline> {
+    // Shaders
+    mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            src: r"
+                #version 450
+
+                layout(location = 0) in vec2 position;
+
+                void main() {
+                    gl_Position = vec4(position, 0.0, 1.0);
+                }
+            ",
+        }
+    }
+
+    mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            src: r"
+                #version 450
+
+                layout(location = 0) out vec4 f_color;
+
+                void main() {
+                    f_color = vec4(1.0, 0.0, 0.0, 1.0);
+                }
+            ",
+        }
+    }
+
+    let pipeline = {
+        let vs = vs::load(device.clone()).unwrap().entry_point("main").unwrap();
+        let fs = fs::load(device.clone()).unwrap().entry_point("main").unwrap();
+
+        let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        ).unwrap();
+
+        let subpass = PipelineRenderingCreateInfo {
+            color_attachment_formats: vec![Some(swapchain.image_format())],
+            ..Default::default()
+        };
+
+        GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState::default()), // Triangles
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    subpass.color_attachment_formats.len() as u32,
+                    ColorBlendAttachmentState::default(),
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            }
+        ).unwrap()
+    };
+    
+    pipeline 
+}
+
 impl App {
     fn new(event_loop: &EventLoop<()>) -> Self {
         let library = VulkanLibrary::new().expect("Vulkan library files was not found.");
@@ -123,11 +327,19 @@ impl App {
             },
         ).expect("Failed to create VkInstance");
 
-        // Physical Devices supporting Vulkan in the way we want
-        let device_extensions = DeviceExtensions {khr_swapchain: true, ..DeviceExtensions::empty()};
-        let (physical_device, queue_family_index) = select_physical_device(&instance, event_loop, &device_extensions);
+        println!("API Version: {}", instance.api_version());
 
+        // Physical Devices supporting Vulkan in the way we want
+        let mut device_extensions = DeviceExtensions {
+            khr_swapchain: true,
+            ..DeviceExtensions::empty()
+        };
+        let (physical_device, queue_family_index) = select_physical_device(&instance, event_loop, &device_extensions);
         println!("Using device: {} (type: {:?})", physical_device.properties().device_name, physical_device.properties().device_type);
+
+        if physical_device.api_version() < Version::V1_3 {
+            device_extensions.khr_dynamic_rendering = true;
+        }
 
         // Create a Logical Device
         let (device, mut queues) = Device::new(
@@ -138,6 +350,10 @@ impl App {
                     ..Default::default()
                 }],
                 enabled_extensions: device_extensions,
+                enabled_features: DeviceFeatures {
+                    dynamic_rendering: true,
+                    ..DeviceFeatures::empty()
+                },
                 ..Default::default()
             },
         ).expect("failed to create device");
@@ -154,12 +370,33 @@ impl App {
             Default::default(),
         ));
 
+        // Triangle Data
+        let vertices = [
+            Vertex { position: [-0.5, -0.25] },
+            Vertex { position: [0.0, 0.5] },
+            Vertex { position: [0.25, -0.1] },
+        ];
+        let vertex_buffer = Buffer::from_iter(
+            memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            vertices,
+        ).unwrap();
+        
         App {
             instance,
             device,
             queue,
-            memory_allocator,
             command_buffer_allocator,
+            render_data: RenderData {
+                vertex_buffer
+            },
             render_context: None
         }
     }
@@ -178,8 +415,7 @@ impl ApplicationHandler for App {
             .physical_device()
             .surface_capabilities(&surface, Default::default())
             .expect("failed to get surface capabilities");
-
-        let dimensions = window.inner_size();
+            
         let composite_alpha = surface_capabilities.supported_composite_alpha.into_iter().next().unwrap();
         let image_format =  self.device
             .physical_device()
@@ -200,94 +436,9 @@ impl ApplicationHandler for App {
             },
         ).unwrap();
 
-        // Shaders
-        mod vs {
-            vulkano_shaders::shader! {
-                ty: "vertex",
-                src: r"
-                    #version 450
-                    layout(location = 0) in vec2 position;
-                    void main() {
-                        gl_Position = vec4(position, 0.0, 1.0);
-                    }
-                ",
-            }
-        }
-
-        mod fs {
-            vulkano_shaders::shader! {
-                ty: "fragment",
-                src: r"
-                    #version 450
-                    layout(location = 0) out vec4 f_color;
-                    void main() {
-                        f_color = vec4(1.0, 0.0, 0.0, 1.0);
-                    }
-                ",
-            }
-        }
-
-        // Render Pass
-        let render_pass = vulkano::single_pass_renderpass!(
-            self.device.clone(),
-            attachments: {
-                color: {
-                    format: swapchain.image_format(),
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: Store,
-                },
-            },
-            pass: {
-                color: [color],
-                depth_stencil: {},
-            }
-        ).unwrap();
-
-        // Framebuffers
-        let framebuffers = get_framebuffers(&images, &render_pass);
-
-        // Pipeline
-        let pipeline = {
-            let vs = vs::load(self.device.clone()).unwrap().entry_point("main").unwrap();
-            let fs = fs::load(self.device.clone()).unwrap().entry_point("main").unwrap();
-
-            let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
-
-            let stages = [
-                PipelineShaderStageCreateInfo::new(vs),
-                PipelineShaderStageCreateInfo::new(fs),
-            ];
-
-            let layout = PipelineLayout::new(
-                self.device.clone(),
-                PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                    .into_pipeline_layout_create_info(self.device.clone())
-                    .unwrap(),
-            ).unwrap();
-
-            let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-
-            GraphicsPipeline::new(
-                self.device.clone(),
-                None,
-                GraphicsPipelineCreateInfo {
-                    stages: stages.into_iter().collect(),
-                    vertex_input_state: Some(vertex_input_state),
-                    input_assembly_state: Some(InputAssemblyState::default()), // Triangles
-                    viewport_state: Some(ViewportState::default()),
-                    rasterization_state: Some(RasterizationState::default()),
-                    multisample_state: Some(MultisampleState::default()),
-                    color_blend_state: Some(ColorBlendState::with_attachment_states(
-                        subpass.num_color_attachments(),
-                        ColorBlendAttachmentState::default(),
-                    )),
-                    dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                    subpass: Some(subpass.into()),
-                    ..GraphicsPipelineCreateInfo::layout(layout)
-                }
-            ).unwrap()
-        };
+        // Vulkan 1.3
+        let attachment_image_views = get_image_views(&images);
+        let pipeline = create_pipeline(&self.device, &swapchain);
 
         // Dynamic viewports allows recreating just the viewport instead of the entire
         // pipeline when the window is resized.
@@ -298,12 +449,11 @@ impl ApplicationHandler for App {
         };
 
         let previous_frame_end = Some(sync::now(self.device.clone()).boxed());
-
+        
         self.render_context = Some(RenderContext {
             window,
             swapchain,
-            render_pass,
-            framebuffers,
+            attachment_image_views,
             pipeline,
             viewport,
             recreate_swapchain: false,
@@ -335,7 +485,9 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) => render_context.recreate_swapchain = true,
+            WindowEvent::Resized(_) => {
+                render_context.recreate_swapchain = true;
+            },
             WindowEvent::RedrawRequested => {
                 let window_size = render_context.window.inner_size();
 
@@ -357,8 +509,12 @@ impl ApplicationHandler for App {
                         }).expect("failed to recreate swapchain");
                     render_context.swapchain = new_swapchain;
 
-                    // Framebuffers are dependent on the swapchain
-                    render_context.framebuffers = get_framebuffers(&new_images, &render_context.render_pass);
+                    // Legacy - Framebuffers are dependent on the swapchain
+                    // render_context.framebuffers = get_framebuffers(&new_images, &render_context.render_pass);
+                    
+                    // 1.3 - Image views must be recreated
+                    render_context.attachment_image_views = get_image_views(&new_images);
+                    
                     render_context.viewport.extent = window_size.into();
                     render_context.recreate_swapchain = false;
                 }
@@ -378,23 +534,6 @@ impl ApplicationHandler for App {
                     render_context.recreate_swapchain = true;
                 }
 
-
-                // Triangle Data
-                let vertices = [
-                    Vertex { position: [-0.5, -0.25] },
-                    Vertex { position: [0.0, 0.5] },
-                    Vertex { position: [0.25, -0.1] },
-                ];
-                let vertex_buffer = Buffer::from_iter(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {usage: BufferUsage::VERTEX_BUFFER, ..Default::default()},
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    vertices,
-                ).unwrap();
-
                 // Build the command buffer
                 let mut builder = AutoCommandBufferBuilder::primary(
                     self.command_buffer_allocator.clone(),
@@ -404,6 +543,18 @@ impl ApplicationHandler for App {
 
                 // Commands
                 builder
+                .begin_rendering(RenderingInfo {
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Clear, // Clear attachment image at start of rendering
+                        store_op: AttachmentStoreOp::Store, // Store it at the end of rendering
+                        clear_value: Some([0.0, 0.0, 0.1, 1.0].into()),
+                        ..RenderingAttachmentInfo::image_view(
+                            render_context.attachment_image_views[image_index as usize].clone(),
+                        )
+                    })],
+                    ..Default::default()
+                }).unwrap()
+                /* Legacy
                 .begin_render_pass(
                     RenderPassBeginInfo {
                         clear_values: vec![Some([0.0, 0.0, 0.1, 1.0].into())],
@@ -415,12 +566,13 @@ impl ApplicationHandler for App {
                         contents: SubpassContents::Inline,
                         ..Default::default()
                     },
-                ).unwrap()
+                ).unwrap()*/
                 .set_viewport(0, [render_context.viewport.clone()].into_iter().collect()).unwrap()
                 .bind_pipeline_graphics(render_context.pipeline.clone()).unwrap()
-                .bind_vertex_buffers(0, vertex_buffer.clone()).unwrap();
-                unsafe { builder.draw(vertex_buffer.len() as u32, 1, 0, 0).unwrap(); }
-                builder.end_render_pass(Default::default()).unwrap();
+                .bind_vertex_buffers(0, self.render_data.vertex_buffer.clone()).unwrap();
+                unsafe { builder.draw(self.render_data.vertex_buffer.len() as u32, 1, 0, 0).unwrap(); }
+                //builder.end_render_pass(Default::default()).unwrap();
+                builder.end_rendering().unwrap();
 
                 let command_buffer = builder.build().unwrap();
 
@@ -439,7 +591,10 @@ impl ApplicationHandler for App {
                         render_context.recreate_swapchain = true;
                         render_context.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
                     },
-                    Err(e) => panic!("failed to flush future: {e}"),
+                    Err(e) => {
+                        println!("failed to flush future: {e}");
+                        render_context.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                    }
                 }
             },
             _ => {},
